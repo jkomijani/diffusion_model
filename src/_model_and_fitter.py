@@ -97,7 +97,7 @@ class Fitter:
         if n_epochs > 0:
             self._train(data_loader, n_epochs)
 
-    def _train(self, data_loader, n_epochs, loss_c0=0):
+    def _train(self, data_loader, n_epochs):
 
         initial_epoch = len(self.train_history['loss'])
 
@@ -112,7 +112,7 @@ class Fitter:
 
         for epoch in range(initial_epoch, initial_epoch + n_epochs):
 
-            loss = self.step(data_loader, loss_c0=loss_c0)
+            loss = self.step(data_loader)
 
             self._checkpoint(epoch, loss)
 
@@ -125,7 +125,7 @@ class Fitter:
             print(f">>> Training finished ({loss.device});", end='')
             print(f" TIME = {t_2 - t_1:.3g} sec <<<")
 
-    def step(self, data_loader, loss_c0=0):
+    def step(self, data_loader):
         """Perform a train step with a batch of inputs of size `batch_size`."""
 
         process = self._model.diffusion_process
@@ -152,11 +152,6 @@ class Fitter:
             score = process.reduced_score_func(rand_t, x_t) - x_t
 
             loss = self.loss_func(score, rms_noise_std, eta)
-
-            if loss_c0 > 0:
-                t_0 = torch.zeros(batch_size, device=x_0.device)
-                score_0 = process.reduced_score_func(t_0, x_0) - x_0
-                loss += loss_c0 * torch.sum((score_0 - action.force(x_0))**2)
 
             self.optimizer.zero_grad()  # clears old gradients from last steps
             loss.backward()
