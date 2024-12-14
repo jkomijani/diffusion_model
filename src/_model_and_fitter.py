@@ -22,14 +22,14 @@ class Model:
         self.diffusion_process = diffusion_process
         self.denoising_flow = DenoisingFlow(diffusion_process)
 
-        self.train = Fitter(self)
+        self.train = Trainer(self)
 
         self.device_handler = ModelDeviceHandler(self)
         self._net = self.diffusion_process  # for use in self.device_handler
 
 
 # =============================================================================
-class Fitter:
+class Trainer:
     """A class for training a given model."""
 
     def __init__(self, model: Model):
