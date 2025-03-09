@@ -1,18 +1,32 @@
 # Created by Javad Komijani, 2024
 
+"""
+This module contains high-level classes for diffusion-based generating models,
+with the central `Model` class integrating essential components such as priors,
+diffusion processes, and actions. It provides utilities for training and
+sampling, along with support for MCMC sampling and device management.
+"""
+
+import time
 import torch
 import numpy as np
-import time
 
-from ._diffusion_process import DiffusionProcess 
+from ._diffusion_process import DiffusionProcess
 from ._diffusion_process import DenoisingFlow
 
 from .device import ModelDeviceHandler
 
+
 # =============================================================================
 class Model:
-
-    def __init__(self, *, prior, action, diffusion_process):
+    """
+    The central high-level class of the package, which integrates instances of
+    essential classes (`prior`, `diffusion_process`, and `action`) to provide
+    utilities for training and sampling. This class interfaces with various
+    core components to facilitate training, posterior inference, MCMC
+    sampling, and device management.
+    """
+    def __init__(self, *, prior, diffusion_process, action):
 
         self.prior = prior
         self.action = action
@@ -30,34 +44,49 @@ class Model:
 class Trainer:
     """A class for training a given model."""
 
+    optimizer_class = torch.optim.AdamW
+    optimizer = None
+    scheduler = None
+
     def __init__(self, model: Model):
+
         self._model = model
 
-        self.train_history = dict(loss=[None])
+        # Initialize training history tracking
+        self.train_history = {'epoch': 0, 'loss': []}
 
-        self.hyperparam = dict(lr=0.01, weight_decay=0.01, betas=(0.9, 0.99))
+        # Default hyperparameters
+        self.hyperparam = {'fused': False, 'betas': (0.9, 0.99)}
 
-        self.checkpoint_dict = dict(print_stride=1)
+        # Checkpoint configuration
+        self.checkpoint_dict = {'print_every': None}
 
-    def __call__(self,
-            data_loader,
-            n_epochs = 200,
-            optimizer_class = torch.optim.AdamW,
-            scheduler = None,
-            loss_func = None,
-            hyperparam = {},
-            checkpoint_dict = {}
-            ):
+        # Default loss function
+        self.loss_func = self.loss_with_noise_var_weight
 
+    def __call__(
+        self,
+        data_loader,
+        n_epochs: int = 200,
+        n_steps: int = 1000,
+        optimizer_class=None,
+        scheduler=None,
+        loss_func=None,
+        hyperparam=None,
+        checkpoint_dict=None
+    ):
         """Fit the model; i.e. train the model.
 
         Parameters
         ----------
         data_loader: generator or None
             Loads true samples for training.
-           
-        n_epochs : int
+
+        n_epochs: int
             Number of epochs of training.
+
+        n_steps: int
+            The total number of steps for reaching `t = 1` from `t = 0`.
 
         optimizer_class : optimization class, optional
             By default is set to torch.optim.AdamW, but can be changed.
@@ -76,41 +105,45 @@ class Trainer:
         checkpoint_dict : dict, optional
             Can be set to control printing the status of the training.
         """
-        self.hyperparam.update(hyperparam)
-        self.checkpoint_dict.update(checkpoint_dict)
+        # Update the attributes of the instance
+        if hyperparam is not None:
+            self.hyperparam.update(hyperparam)
 
-        if loss_func is None:
-            self.loss_func = self.loss_with_ms_weight
-        else:
+        if checkpoint_dict is not None:
+            self.checkpoint_dict.update(checkpoint_dict)
+
+        if loss_func is not None:
             self.loss_func = loss_func
 
-        parameters = self._model.diffusion_process.parameters()
-        self.optimizer = optimizer_class(parameters, **self.hyperparam)
+        if optimizer_class is not None:
+            self.optimizer_class = optimizer_class
 
-        if scheduler is None:
-            self.scheduler = None
-        else:
+        parameters = self._model.diffusion_process.parameters()
+        self.optimizer = self.optimizer_class(parameters, **self.hyperparam)
+
+        if scheduler is not None:
             self.scheduler = scheduler(self.optimizer)
 
         if n_epochs > 0:
-            self._train(data_loader, n_epochs)
+            self._train(data_loader, n_epochs, n_steps)
 
-    def _train(self, data_loader, n_epochs):
-
-        initial_epoch = len(self.train_history['loss'])
+    def _train(self, data_loader, n_epochs, n_steps):
 
         self.train_history['loss'].extend([None] * n_epochs)
 
         rank = self._model.device_handler.rank
 
-        if rank == 0:
+        last_epoch = self.train_history['epoch']
+        report_progress = self.checkpoint_dict['print_every'] is not None
+
+        if rank == 0 and report_progress:
             print(f">>> Training started for {n_epochs} epochs <<<")
 
         t_1 = time.time()
 
-        for epoch in range(initial_epoch, initial_epoch + n_epochs):
+        for epoch in range(last_epoch + 1, last_epoch + 1 + n_epochs):
 
-            loss = self.step(data_loader)
+            loss = self.step(data_loader, n_steps)
 
             self._checkpoint(epoch, loss)
 
@@ -119,37 +152,34 @@ class Trainer:
 
         t_2 = time.time()
 
-        if rank == 0:
+        if rank == 0 and report_progress:
             print(f">>> Training finished ({loss.device});", end='')
             print(f" TIME = {t_2 - t_1:.3g} sec <<<")
 
-    def step(self, data_loader):
+    def step(self, data_loader, n_steps):
         """Perform a train step with a batch of inputs of size `batch_size`."""
 
         process = self._model.diffusion_process
-        omega = self._model.diffusion_process.omega
-        action = self._model.action
 
         loss_sum = 0
         n_samples = 0
+        step_size = 1 / n_steps
 
         for x_0, in data_loader:
 
             batch_size = x_0.shape[0]
 
-            rand_t = torch.rand(batch_size, device=x_0.device)
-            reshapeed_rand_t = rand_t.reshape(-1, *[1]* (x_0.ndim - 1))
+            time_steps = torch.randint(
+                1, n_steps + 1, (batch_size,), device=x_0.device
+            )
 
-            decay_factor = process.decay_factor(reshapeed_rand_t)
-            rms_noise_std = process.rms_noise_std(reshapeed_rand_t)
+            x_t, eps, noise_std = process.run_diffusion_process_for_training(
+                x_0, time_steps, step_size
+            )
 
-            eta = torch.randn_like(x_0)
+            score = process.score_func(time_steps * step_size, x_t)
 
-            x_t = decay_factor * x_0 + rms_noise_std * eta
-
-            score = process.reduced_score_func(rand_t, x_t) - x_t
-
-            loss = self.loss_func(score, rms_noise_std, eta)
+            loss = self.loss_func(score, eps, noise_std)
 
             self.optimizer.zero_grad()  # clears old gradients from last steps
             loss.backward()
@@ -160,27 +190,36 @@ class Trainer:
 
         return loss_sum / n_samples
 
-    def loss_with_ms_weight(self, score, rms_noise_std, eta):
-        """The default loss function."""
-        return torch.mean((score * rms_noise_std + eta)**2)
+    @staticmethod
+    def loss_with_noise_var_weight(score, eps, noise_std):
+        r"""
+        Returns the loss based on implicit score matching with the weight over
+        time set to the variance of the effective noise added to the variable.
+        """
+        return torch.mean((score * noise_std + eps)**2)
 
-    def loss_with_rms_weight(self, score, rms_noise_std, eta):
-        """A loss function with an alternative weight over time."""
+    def loss_with_noise_std_weight(score, eps, noise_std):
+        r"""
+        Returns the loss based on implicit score matching with the weight over
+        time set to `\lambda(t) = \sqrt{1 - e^{-\omega t}}`, which is
+        `rms_noise_std`.
+        """
         omega = self._model.diffusion_process.omega
-        const = torch.acosh(torch.exp(omega)) / omega * np.prod(eta.shape)
-        return torch.mean(score * (score * rms_noise_std + 2 * eta)) + const
+        const = torch.acosh(torch.exp(omega)) / omega * np.prod(eps.shape)
+        return torch.mean(score * (score * noise_std + 2 * eps)) + const
 
     @torch.no_grad()
     def _checkpoint(self, epoch, loss):
 
         rank = self._model.device_handler.rank
 
-        stride = self.checkpoint_dict['print_stride']
+        every = self.checkpoint_dict['print_every']
 
         loss = self._model.device_handler.all_gather_into_tensor(loss).item()
 
-        if rank == 0 and (epoch % stride == 0 or epoch == 1):
+        if rank == 0 and every is not None and epoch % every == 0:
             print(f"Epoch: {epoch} | loss: {loss:.4f}")
 
         if rank == 0:
-            self.train_history['loss'][epoch] = loss
+            self.train_history['epoch'] = epoch
+            self.train_history['loss'][epoch - 1] = loss
