@@ -1,30 +1,36 @@
 # Created by Javad Komijani, 2024
 
+"""Implements the diffusion process."""
+
 import torch
 import scipy
 import numpy as np
+
+from torch_solve_ext.integrate import ODEflow
 
 Tensor = torch.Tensor
 
 
 # =============================================================================
-class DiffusionProcess(torch.nn.Module):
-    r"""Implements a diffusion process."""
+class DiffusionProcess:
+    r"""Implements a diffusion process as:
+
+    .. math:
+
+        d x(t) / dt = - \omega x(t) + \sigma \eta(t)
+
+    with :math:`\sigma = \sqrt{2\omega}`.
+    """
 
     def __init__(self, score_func: torch.nn.Module, omega: float = np.pi):
 
-        super().__init__()
         self.score_func = score_func
         self.omega = omega
         self.sigma = (2 * omega)**0.5  # hard-wired
 
-    def forward_drift(self, t: Tensor, x_t: Tensor):
-        """Computes the drift term in the diffusion process."""
-        return - self.omega * x_t
-
-    def reverse_drift(self, t: Tensor, x_t: Tensor, sigma_tilde: float = 0):
+    def denoising_drift(self, t: Tensor, x_t: Tensor, sigma_tilde: float = 0):
         """
-        Computes the drift term in the reverse diffusion process.
+        Computes the drift term in the denoising process.
 
         Args:
             - t (Tensor): A 1-dimensional tensor representing time,
@@ -36,152 +42,85 @@ class DiffusionProcess(torch.nn.Module):
         Returns:
             Tensor: The computed drift term for the reverse diffusion process.
         """
-        if t.shape[0] == 1:
-            t = t.repeat(x_t.shape[0])
         score = self.score_func(t, x_t)
-        coeff = (self.omega + sigma_tilde**2 / 2)
+        coeff = self.omega + sigma_tilde**2 / 2
 
         return -self.omega * x_t - coeff * score
 
-    def run_diffusion_process_for_training(
-        self, x_0: Tensor, n_steps: Tensor, step_size: float
-    ):
-        """Simulates the (forward) diffusion processes."""
-  
-        time = step_size * n_steps.reshape(-1, *[1] * (x_0.ndim - 1))
-        dcy = self.decay_factor(time)
-        std = self.effective_noise_std(0, time)
+    def run_for_training(self, x_0: Tensor, t_steps: Tensor, step_size: float):
+        """
+        Suitable for training: simulates the diffusion processes from 0 to
+        `t_steps`, which is a 1 dimensional tensor.
+        """
+        # first we increase the dimensions of `t_steps` to match `x_0`
+        t_steps = t_steps.view(-1, *[1] * (x_0.ndim - 1))
+        t_eval = step_size * t_steps
+
+        dcy = torch.exp(- self.omega * t_eval)
+        std = torch.sqrt(1 - dcy**2)
         eps = torch.randn_like(x_0)
 
         x_t = dcy * x_0 + std * eps
 
         return x_t, eps, std
 
-    def run_diffusion_process(self, x_init, t_init=0, t_eval=[1]):
-        """Simulates the (forward) diffusion processes."""
-
-        batch_size = x_init.shape[0]
-
-        t_shape = [-1, *[1] * (x_init.ndim - 1)]
-        t_init = torch.tensor(t_init).reshape(*t_shape)
+    def run_diffusion_process(self, x_0: Tensor, t_0=0, t_eval=(1,)):
+        """Simulates the diffusion processes."""
 
         x_eval = [None] * len(t_eval)
 
-        for ind in range(len(t_eval)):
+        for ind, t_ind in enumerate(t_eval):
 
-            t = torch.tensor(t_eval[ind]).reshape(*t_shape)
+            assert t_ind >= t_0
 
-            dcy = self.decay_factor(t - t_init)
-            std = self.effective_noise_std(t_init, t)
-            eps = torch.randn_like(x_init)
+            dcy = np.exp(- self.omega * (t_ind - t_0))
+            std = np.sqrt(1 - dcy**2)
+            eps = torch.randn_like(x_0)
 
-            x_eval[ind] = dcy * x_init + std * eps
+            x_eval[ind] = dcy * x_0 + std * eps
 
-            # for the next round
-            t_init = t
-            x_init = x_eval[ind]
+            x_0, t_0 = x_eval[ind], t_ind  # for the next round
 
         return x_eval
 
-    def run_denoising_process(
-        self, x_init, t_init=1, t_eval=[0], sigma_tilde=None
-    ):
-        # UNDER CONSTRUCTION
-        """Simulates the reverse diffusion process."""
-
+    def run_denoising_process(self, x_0, t_0=1, t_eval=(0,), sigma_tilde=None):
+        """Simulates the denoising process."""
+        # ***UNDER CONSTRUCTION***
         if sigma_tilde is None:
             sigma_tilde = self.sigma
 
-    def decay_factor(self, t):
-        r"""Returns :math:`e^{-\omega t}`."""
-        return torch.exp(- self.omega * t)
-
-    def effective_noise_std(self, t_a, t_b):
-        r"""
-        Returns the standard deviation of the effective noise at time `t` in
-        the closed-form solution of the diffusion process with vanishing drift
-        in variance-expanding picture.
-
-        This method computes the normalizaed root-mean-square (RMS) of
-        :math:`g(t) = e^{\omega t} \sqrt{2 \omega}` using the formula:
-
-        .. math::
-
-            \text{RMS} = \sqrt{| \int_a^b dt g(t)^2 |} e^{-\omega b}
-
-        The output represents the coefficient of the normal noise term in the
-        SDE, determining the standard deviation of the noise contributing to
-        the SDE. The function utilizes the closed-form solution
-        math:`\sqrt{e^{-2 \omega t_a} - e^{-2 \omega t_b}}`.
-        """
-        coeff = 2 * self.omega
-        return (1 - torch.exp(coeff * (t_a - t_b))).abs()**0.5
+    @property
+    def denoising_flow(self):
+        """This is a deterministic ODE, unlike denoising process."""
+        return DenoisingFlow(self.denoising_drift)
 
 
 # =============================================================================
-class DenoisingFlow:
+class DenoisingFlow(ODEflow):
+    """Denoising flow is a deterministic evolution of state variables.
 
-    def __init__(
-        self,
-        diffusion_process: DiffusionProcess,
-        solver: str = 'scipy.solve_ivp'
-    ):
+    The super class has `forward` and `reverse` methods.
+    """
+    def __init__(self, denoising_drift, t_span=(1, 0), **kwargs):
+        super().__init__(denoising_drift, t_span, method='Euler', **kwargs)
 
-        super().__init__()
 
-        self.diffusion_process = diffusion_process
+# =============================================================================
+@torch.no_grad
+def scipy_solve_ivp(func, t_span, x_0, t_eval=(0,), **solver_kwargs):
 
-        if solver == 'scipy.solve_ivp':
-            solver = self.scipy_solve_ivp
-        else:
-            assert not isinstance(str, solver), "solver not recognized"
+    x_shape = x_0.shape
+    x_0 = x_0.cpu().numpy().ravel()
 
-        self.solver = solver
+    def func_scipy_wrapper(t, x):
+        t = torch.tensor([t]).repeat(x_shape[0])
+        x = torch.tensor(x.reshape(x_shape))
+        return func(t, x).cpu().numpy().ravel()
 
-    def forward(self, x_init, t_span=[1, 0], t_eval=[0], **solver_kwargs):
-        return self.solver(t_span, x_init, t_eval=t_eval, **solver_kwargs)
+    res = scipy.integrate.solve_ivp(
+        func_scipy_wrapper, t_span, x_0, t_eval=t_eval, **solver_kwargs
+    )
 
-    def reverse(self, x_init, t_span=[0, 1], t_eval=[1], **solver_kwargs):
-        return self.solver(t_span, x_init, t_eval=t_eval, **solver_kwargs)
+    y_reshape = x_shape if len(t_eval) == 1 else (*x_shape, len(t_eval))
 
-    @torch.no_grad
-    def scipy_solve_ivp(self, t_span, x_init, t_eval=[0], **solve_kwargs):
-
-        score_func = self.diffusion_process.reverse_drift
-
-        x_shape = x_init.shape
-        x_init = x_init.cpu().numpy().ravel()
-
-        def scipy_wrapper(t, x):
-            return score_func(
-                    torch.tensor([t]), torch.tensor(x.reshape(x_shape))
-                    ).cpu().numpy().ravel()
-
-        res = scipy.integrate.solve_ivp(
-            scipy_wrapper, t_span, x_init, t_eval=t_eval, **solve_kwargs
-        )
-        if len(t_eval) == 1:
-            return torch.tensor(res.y).reshape(*x_shape)
-        else:
-            return torch.tensor(res.y).reshape(*x_shape, len(t_eval))
-
-    def torch_solve_ivp(self, simga_tilde=0, **kwargs):
-        # UNDER CONSTRUCTION
-
-        drift = Drift4ReverseProcess(
-            self.score_func,
-            omega=self.omega,
-            sigma_tilde=sigma_tilde
-        )
-
-        kwargs.update({'t_span': [1, 0]})
-
-        if sigma_tilde == 0:
-            reverse_flow = ODEflow(drift, **kwargs)
-
-        else:
-            reverse_flow = StochODEflow(
-                drift, noise_std_func=lambda *args: sigma_tilde, **kwargs
-            )
-
-        self.reverse_flow = reverse_flow
+    return torch.tensor(res.y).reshape(*y_reshape)
