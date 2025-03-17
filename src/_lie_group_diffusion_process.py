@@ -43,25 +43,21 @@ class LieGroupDiffusionProcess(ABC):
         if sigma is not None:
             self.sigma = sigma
 
-    def denoising_drift(self, t: Tensor, y_t: Tensor, sigma_tilde: float = 0):
+    def denoising_drift(self, t: Tensor, x_t: Tensor, sigma_tilde: float = 0):
         """
         Computes the drift term in the denoising process.
 
-        The drift term governs the direction of the reverse diffusion process,
-        helping to denoise the state `y_t` based on the score function and the
-        time-dependent coefficients.
-
         Args:
             - t (Tensor): A 1-dimensional tensor representing the time,
-              corresponding to the batch axis of `y_t`.
-            - y_t (Tensor): The current state of the system at time `t`.
+              corresponding to the batch axis of `x_t`.
+            - x_t (Tensor): The current state of the system at time `t`.
             - sigma_tilde (float, optional): A scaling factor to adjust the
               noise. Default is `0`, meaning no noise.
 
         Returns:
             Tensor: The drift term, which is used in the denoising process.
         """
-        score = self.score_func(t, y_t)
+        score = self.score_func(t, x_t)
         coeff = (self.sigma**2 + sigma_tilde**2) / 2
 
         return - coeff * score
@@ -84,7 +80,7 @@ class LieGroupDiffusionProcess(ABC):
 
         Returns:
             tuple:
-                - Tensor: `y_t` (noisy state): The noisy states after applying
+                - Tensor: `x_t` (noisy state): The noisy states after applying
                   the diffusion process over the specified time steps.
 
                 - Tensor: `alg / std` (normalized algebraic state): The state
@@ -94,7 +90,7 @@ class LieGroupDiffusionProcess(ABC):
 
                 - Tensor: `std`: The accumulated standard deviation (noise)
                   over time. This tensor tracks how much noise has been added
-                  to the state during the diffusion process.
+                  to the algebraic state during the diffusion process.
         """
         assert t_steps.shape[0] == x_0.shape[0]
 
@@ -142,10 +138,10 @@ class LieGroupDiffusionProcess(ABC):
 
         Returns:
             list:
-                - A list of states (`y_eval`) at the specified evaluation
+                - A list of states (`x_eval`) at the specified evaluation
                   times in `t_eval`.
         """
-        y_eval = [None] * len(t_eval)  # Initialize list for evaluated states
+        x_eval = [None] * len(t_eval)  # Initialize list for evaluated states
         step_std = self.sigma * step_size**0.5  # std of noise at each step
         t = t_0  # Current time set to t_0
 
@@ -161,9 +157,9 @@ class LieGroupDiffusionProcess(ABC):
                 x_0 = randn_grp @ x_0
                 t += step_size
 
-            y_eval[ind] = x_0  # Store the state at the current evaluation time
+            x_eval[ind] = x_0  # Store the state at the current evaluation time
 
-        return y_eval  # Return the list of evaluated states
+        return x_eval  # Return the list of evaluated states
 
     def run_denoising_process(self, x_0, t_0=1, t_eval=(0,), step_size=0.001):
         """Simulates the denoising process."""
