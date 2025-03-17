@@ -20,27 +20,28 @@ class LieGroupDiffusionProcess(ABC):
     The process follows the stochastic differential equation:
 
     .. math::
-        \frac{d y(t)}{dt} = \sigma e^{\omega t} \eta_t
+        \frac{d x(t)}{dt} = \sigma \eta_t
 
-    where :math:`\sigma = \sqrt{2\omega}`, and :math:`\eta_t` represents noise.
-    This diffusion process governs the evolution of a state on a Lie group,
-    with the time-dependent, variance-expanding noise.
+    where :math:`x(t)` is the state variable as a Lie-group member,
+    :math:`\sigma` is a constant, and :math:`\eta_t` represents noise.
     """
 
-    def __init__(self, score_func: torch.nn.Module, omega: float = np.pi):
+    sigma = (2 * np.pi)**0.5
+
+    def __init__(self, score_func: torch.nn.Module, sigma: float = None):
         r"""
         Initializes the LieGroupDiffusionProcess with the given parameters.
 
         Args:
             - score_func (torch.nn.Module): The neural network module used to
               esimated the score function (gradient of the log-probability).
-            - omega (float, optional): A constant influencing the rate of
-              diffusion or the rate of increament in the noise variance.
-              Default is :math:`\pi`.
+            - sigma (float, optional): The coefficient of the stochastic
+              normalized noise. If not provided, the defaut value of
+              :math:`\sqrt{2 \pi}` is used.
         """
         self.score_func = score_func
-        self.omega = omega
-        self.sigma = (2 * omega)**0.5  # Hardwired value
+        if sigma is not None:
+            self.sigma = sigma
 
     def denoising_drift(self, t: Tensor, y_t: Tensor, sigma_tilde: float = 0):
         """
@@ -61,23 +62,22 @@ class LieGroupDiffusionProcess(ABC):
             Tensor: The drift term, which is used in the denoising process.
         """
         score = self.score_func(t, y_t)
-        omega = self.omega
-        coeff = (omega + sigma_tilde**2 / 2) * torch.exp(2 * omega * t)
+        coeff = (self.sigma**2 + sigma_tilde**2) / 2
 
         return - coeff * score
 
-    def run_for_training(self, y_0: Tensor, t_steps: Tensor, step_size: float):
+    def run_for_training(self, x_0: Tensor, t_steps: Tensor, step_size: float):
         """
         Simulates the forward diffusion process for training purposes.
 
         This method simulates the forward diffusion process starting from an
-        initial state `y_0`, which is a tensor of the Lie group elements, over
+        initial state `x_0`, which is a tensor of the Lie group elements, over
         discrete time steps `t_steps`. The method computes noisy states and
         their noise characteristics, which can be used for training denoising
         models.
 
         Args:
-            - y_0 (Tensor): The initial state of the system at time `t = 0`.
+            - x_0 (Tensor): The initial state of the system at time `t = 0`.
             - t_steps (Tensor): A 1D tensor of random time steps corresponding
               to the batch axis of `x_0`.
             - step_size (float): The step size used for numerical integration.
@@ -96,46 +96,43 @@ class LieGroupDiffusionProcess(ABC):
                   over time. This tensor tracks how much noise has been added
                   to the state during the diffusion process.
         """
-        assert t_steps.shape[0] == y_0.shape[0]
+        assert t_steps.shape[0] == x_0.shape[0]
 
         max_t_steps = torch.max(t_steps)
-        t_steps = t_steps.view(-1, *[1] * (y_0.ndim - 1))
+        t_steps = t_steps.view(-1, *[1] * (x_0.ndim - 1))
 
-        t = 0  # Initial time set to 0
-        w = self.omega  # Diffusion rate parameter
+        step_std = self.sigma * step_size**0.5  # std of noise at each step
+        t = 0  # Current time set to 0
 
-        # Initialize algebraic state and variance tensors
-        alg = torch.zeros_like(y_0)  # Random walk in `algebra` space
-        var = torch.zeros_like(t_steps + 0.)  # Variance of alg at each time
+        # Initialize algebraic state
+        alg = torch.zeros_like(x_0)
 
         # Loop over the maximum number of steps
         for step in range(1, 1 + max_t_steps):
 
+            # Make std is 0 if time is larger than the evaluation time
+            std = step_std * (step <= t_steps)
+
+            randn_grp, randn_alg = self.randn_lie_like(x_0.real, scale=std)
+
+            x_0 = randn_grp @ x_0
+            alg = randn_alg + alg
             t += step_size
 
-            # Calculate standard deviation for noise and generate noise
-            std = (1 - np.exp(-2 * w * step_size))**0.5 * np.exp(w * t)
-            # Make std is 0 if time is larger than the evaluation time
-            std = std * (step <= t_steps)
+        std = step_std * t_steps**0.5  # std of noise of each sample
 
-            randn_grp, randn_alg = self.randn_lie_like(y_0.real, scale=std)
+        return x_0, alg / std, std
 
-            y_0 = randn_grp @ y_0
-            alg = randn_alg + alg
-            var += std**2
-
-        return y_0, alg / var**0.5, var**0.5
-
-    def run_diffusion_process(self, y_0, t_0=0, t_eval=(1,), step_size=0.001):
+    def run_diffusion_process(self, x_0, t_0=0, t_eval=(1,), step_size=0.001):
         """Simulates the diffusion process over specified times.
 
         This method simulates the forward diffusion process starting from an
-        initial state `y_0`. The diffusion is applied till the specified times
+        initial state `x_0`. The diffusion is applied till the specified times
         given by `t_eval`, updating the state incrementally at each time step.
         The method returns the states at the specified evaluation times.
 
         Args:
-            - y_0 (Tensor): The initial state of the system at time `t = 0`.
+            - x_0 (Tensor): The initial state of the system at time `t = 0`.
             - t_0 (float, optional): The starting time. Default is `0`.
             - t_eval (tuple of flaots): A tuple of evaluation times at which to
               observe the state. Each time in `t_eval` should be greater than
@@ -149,8 +146,8 @@ class LieGroupDiffusionProcess(ABC):
                   times in `t_eval`.
         """
         y_eval = [None] * len(t_eval)  # Initialize list for evaluated states
+        step_std = self.sigma * step_size**0.5  # std of noise at each step
         t = t_0  # Current time set to t_0
-        w = self.omega  # Diffusion rate parameter
 
         # Iterate through evaluation times
         for ind, t_target in enumerate(t_eval):
@@ -159,20 +156,16 @@ class LieGroupDiffusionProcess(ABC):
 
             while t < t_target:  # Iterate until reaching the target time
 
+                # Generate noise, and update the state and time
+                randn_grp, _ = self.randn_lie_like(x_0.real, scale=step_std)
+                x_0 = randn_grp @ x_0
                 t += step_size
 
-                # Calculate standard deviation for noise and generate noise
-                std = (1 - np.exp(-2 * w * step_size))**0.5 * np.exp(w * t)
-                randn_grp, _ = self.randn_lie_like(y_0.real, scale=std)
-
-                # Update the state and time
-                y_0 = randn_grp @ y_0
-
-            y_eval[ind] = y_0  # Store the state at the current evaluation time
+            y_eval[ind] = x_0  # Store the state at the current evaluation time
 
         return y_eval  # Return the list of evaluated states
 
-    def run_denoising_process(self, y_0, t_0=1, t_eval=(0,), step_size=0.001):
+    def run_denoising_process(self, x_0, t_0=1, t_eval=(0,), step_size=0.001):
         """Simulates the denoising process."""
         pass  # NOT READY
 
@@ -208,6 +201,9 @@ class UnitaryDiffusionProcess(LieGroupDiffusionProcess):
     """
     This class implements a diffusion process for generating unitary matrices
     based on the Lie group structure.
+
+    NOTE: Instead of using this class, we recommend separting the group to
+    `U(1) x SU(n)` and evaluating the process for each sub-group separately.
     """
 
     @staticmethod
@@ -234,7 +230,7 @@ class UnitaryDiffusionProcess(LieGroupDiffusionProcess):
         return randn_grp, randn_alg
 
 
-class SUnitaryDiffusionProcess(LieGroupDiffusionProcess):
+class SUnDiffusionProcess(LieGroupDiffusionProcess):
     """
     This class implements a diffusion process specifically for the special
     unitary group SU(n).
@@ -277,7 +273,7 @@ class LieGroupDenoisingFlow(LieGroupODEflow):
 
 # =============================================================================
 def randn_antihermitian_like(mtrx: Tensor) -> Tensor:
-    """
+    r"""
     Generates random anti-Hermitian matrices with the same shape as the input.
 
     Both the real and imaginary parts of the non-diagonal elements are drawn
