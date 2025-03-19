@@ -33,12 +33,12 @@ class Model:
 
         self.device_handler = ModelDeviceHandler(self)
 
-    @property
-    def denoising_flow(self):
+    def denoising_flow(self, **kwargs):
         """
-        Denoising flow is the deterministic evolution in the reverse direction.
+        Alias for `self.diffusion_process.denoising_flow`, which creates and
+        returns a module that performs denoising using a deterministic ODE.
         """
-        return self.diffusion_process.denoising_flow
+        return self.diffusion_process.denoising_flow(**kwargs)
 
 
 # =============================================================================
@@ -59,7 +59,7 @@ class Trainer:
         self.train_history = {'epoch': 0, 'loss': []}
 
         # Default hyperparameters
-        self.hyperparam = {'fused': False, 'betas': (0.9, 0.99)}
+        self.hyperparam = {'fused': False}
 
         # Checkpoint configuration
         self.checkpoint_dict = {'print_every': None}
@@ -70,8 +70,8 @@ class Trainer:
     def __call__(
         self,
         data_loader,
-        n_epochs: int = 200,
-        n_timesteps: int = 1000,
+        n_epochs: int = 100,
+        n_timesteps: int = 100,
         optimizer_class=None,
         scheduler=None,
         loss_func=None,
@@ -192,8 +192,9 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
 
-            loss_sum += loss * bsize
-            n_samples += bsize
+            with torch.no_grad():
+                loss_sum += bsize * loss
+                n_samples += bsize
 
         return loss_sum / n_samples
 

@@ -56,9 +56,9 @@ class DiffusionProcess:
         t_steps = t_steps.view(-1, *[1] * (x_0.ndim - 1))
         t_eval = step_size * t_steps
 
-        dcy = torch.exp(- self.omega * t_eval)
-        std = torch.sqrt(1 - dcy**2)
-        eps = torch.randn_like(x_0)
+        dcy = torch.exp(- self.omega * t_eval)  # decay factor of signal
+        std = torch.sqrt(1 - dcy**2)  # std of integrated noise at time t_eval
+        eps = torch.randn_like(x_0)  # normalized noise
 
         x_t = dcy * x_0 + std * eps
 
@@ -69,17 +69,17 @@ class DiffusionProcess:
 
         x_eval = [None] * len(t_eval)
 
-        for ind, t_ind in enumerate(t_eval):
+        for ind, t in enumerate(t_eval):
 
-            assert t_ind >= t_0
+            assert t >= t_0, "`t_eval` must monotonically increase."
 
-            dcy = np.exp(- self.omega * (t_ind - t_0))
-            std = np.sqrt(1 - dcy**2)
-            eps = torch.randn_like(x_0)
+            dcy = np.exp(- self.omega * (t - t_0))  # signal's decay factor
+            std = np.sqrt(1 - dcy**2)  # std of integrated noise at time t
+            eps = torch.randn_like(x_0)  # normalized noise
 
             x_eval[ind] = dcy * x_0 + std * eps
 
-            x_0, t_0 = x_eval[ind], t_ind  # for the next round
+            x_0, t_0 = x_eval[ind], t  # for the next round
 
         return x_eval
 
@@ -89,26 +89,25 @@ class DiffusionProcess:
         if sigma_tilde is None:
             sigma_tilde = self.sigma
 
-    @property
-    def denoising_flow(self):
-        """This is a deterministic ODE, unlike denoising process."""
-        return DenoisingFlow(self.denoising_drift)
+    def denoising_flow(self, t_span=(1, 0), method='Euler', step_size=0.001):
+        """
+        Creates and returns an instance of `ODEflow` that performs denoising
+        using a deterministic ordinary differential equation (ODE).
 
+        Unlike `run_denoising_process`, which solves a stochastic differential
+        equation (SDE) for denoising, this method follows a deterministic
+        approach.
 
-# =============================================================================
-class DenoisingFlow(ODEflow):
-    """Denoising flow is a deterministic evolution of state variables.
-
-    The super class has `forward` and `reverse` methods.
-    """
-    def __init__(self, denoising_drift, t_span=(1, 0), **kwargs):
-        super().__init__(denoising_drift, t_span, method='Euler', **kwargs)
+        Note that the `ODEflow` class has `forward` and `reverse` methods.
+        """
+        kwargs = {'method': method, 'step_size': step_size}
+        return ODEflow(self.denoising_drift, t_span, **kwargs)
 
 
 # =============================================================================
 @torch.no_grad
 def scipy_solve_ivp(func, t_span, x_0, t_eval=(0,), **solver_kwargs):
-
+    """Solving an initial value problem with scipy."""
     x_shape = x_0.shape
     x_0 = x_0.cpu().numpy().ravel()
 
